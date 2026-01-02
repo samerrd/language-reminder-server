@@ -1,14 +1,12 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Optional
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import os
 
-# ======================
-# Database
-# ======================
+# =================================
+# Database (SQLite)
+# =================================
 DB_PATH = "sentences.db"
 
 def get_db():
@@ -34,14 +32,14 @@ def init_db():
 
 init_db()
 
-# ======================
+# =================================
 # FastAPI
-# ======================
+# =================================
 app = FastAPI(title="Language Reminder Server")
 
-# ======================
+# =================================
 # Models
-# ======================
+# =================================
 class SentenceIn(BaseModel):
     text: str
     level: str
@@ -50,9 +48,9 @@ class SentenceIn(BaseModel):
 class ReviewUpdate(BaseModel):
     review_state: str  # again | hard | good | easy
 
-# ======================
+# =================================
 # Helpers
-# ======================
+# =================================
 def calc_next_review(state: str) -> str:
     now = datetime.utcnow()
     mapping = {
@@ -63,9 +61,9 @@ def calc_next_review(state: str) -> str:
     }
     return mapping.get(state, now + timedelta(days=1)).isoformat()
 
-# ======================
+# =================================
 # Routes
-# ======================
+# =================================
 @app.get("/health")
 def health():
     return {"ok": True, "service": "language-reminder-server"}
@@ -91,11 +89,7 @@ def get_sentences(limit: int = 50):
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
-    return {
-        "ok": True,
-        "count": len(rows),
-        "sentences": [dict(r) for r in rows]
-    }
+    return {"ok": True, "count": len(rows), "sentences": [dict(r) for r in rows]}
 
 @app.get("/next")
 def next_sentence():
@@ -109,10 +103,8 @@ def next_sentence():
         LIMIT 1
     """, (now,)).fetchone()
     conn.close()
-
     if not row:
         return {"ok": True, "sentence": None}
-
     return {"ok": True, "sentence": dict(row)}
 
 @app.post("/review/{sentence_id}")
