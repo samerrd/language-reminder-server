@@ -1,13 +1,14 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# =================================
+# ======================
 # Database (SQLite)
-# =================================
-DB_PATH = "sentences.db"
+# ======================
+DB_PATH = os.environ.get("DB_PATH", "sentences.db")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -32,14 +33,14 @@ def init_db():
 
 init_db()
 
-# =================================
+# ======================
 # FastAPI
-# =================================
+# ======================
 app = FastAPI(title="Language Reminder Server")
 
-# =================================
+# ======================
 # Models
-# =================================
+# ======================
 class SentenceIn(BaseModel):
     text: str
     level: str
@@ -48,9 +49,9 @@ class SentenceIn(BaseModel):
 class ReviewUpdate(BaseModel):
     review_state: str  # again | hard | good | easy
 
-# =================================
+# ======================
 # Helpers
-# =================================
+# ======================
 def calc_next_review(state: str) -> str:
     now = datetime.utcnow()
     mapping = {
@@ -61,9 +62,9 @@ def calc_next_review(state: str) -> str:
     }
     return mapping.get(state, now + timedelta(days=1)).isoformat()
 
-# =================================
+# ======================
 # Routes
-# =================================
+# ======================
 @app.get("/health")
 def health():
     return {"ok": True, "service": "language-reminder-server"}
@@ -99,17 +100,20 @@ def next_sentence():
         SELECT * FROM sentences
         WHERE next_review_at IS NULL
            OR next_review_at <= ?
-        ORDER BY next_review_at ASC
+        ORDER BY COALESCE(next_review_at, created_at) ASC
         LIMIT 1
     """, (now,)).fetchone()
     conn.close()
+
     if not row:
         return {"ok": True, "sentence": None}
+
     return {"ok": True, "sentence": dict(row)}
 
 @app.post("/review/{sentence_id}")
 def review(sentence_id: int, body: ReviewUpdate):
     next_time = calc_next_review(body.review_state)
+
     conn = get_db()
     cur = conn.execute("""
         UPDATE sentences
