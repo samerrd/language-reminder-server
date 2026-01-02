@@ -2,63 +2,95 @@ import os
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-DATA_FILE = "data.json"
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return []
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# تخزين الجمل في الذاكرة (مؤقتًا)
+SENTENCES = []
 
 class Handler(BaseHTTPRequestHandler):
 
+    def _set_headers(self, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
     def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
+        if self.path == "/":
+            self._set_headers()
             self.wfile.write(json.dumps({
                 "ok": True,
                 "service": "language-reminder-server"
             }).encode())
-            return
 
-        if self.path == "/sentences":
-            data = load_data()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
-            return
+        elif self.path == "/health":
+            self._set_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "service": "language-reminder-server"
+            }).encode())
 
-        self.send_response(404)
-        self.end_headers()
+        elif self.path == "/sentences":
+            self._set_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "count": len(SENTENCES),
+                "sentences": SENTENCES
+            }).encode())
+
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": "Not found"
+            }).encode())
 
     def do_POST(self):
         if self.path != "/ingest":
-            self.send_response(404)
-            self.end_headers()
+            self._set_headers(404)
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": "Not found"
+            }).encode())
             return
 
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        payload = json.loads(body)
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
 
-        data = load_data()
-        data.append(payload)
-        save_data(data)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": "Invalid JSON"
+            }).encode())
+            return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
+        text = data.get("text")
+        level = data.get("level", "unknown")
+        source = data.get("source", "unknown")
+
+        if not text:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": "Missing 'text'"
+            }).encode())
+            return
+
+        entry = {
+            "text": text,
+            "level": level,
+            "source": source
+        }
+
+        SENTENCES.append(entry)
+
+        self._set_headers()
         self.wfile.write(json.dumps({
             "ok": True,
-            "saved": True
+            "saved": True,
+            **entry
         }).encode())
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
