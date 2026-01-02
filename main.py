@@ -2,41 +2,63 @@ import os
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+DATA_FILE = "data.json"
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, code: int, payload: dict):
-        data = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/health":
-            return self._send_json(200, {"ok": True, "service": "language-reminder-server"})
-        return self._send_json(404, {"ok": False, "error": "Not found"})
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "service": "language-reminder-server"
+            }).encode())
+            return
+
+        if self.path == "/sentences":
+            data = load_data()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         if self.path != "/ingest":
-            return self._send_json(404, {"ok": False, "error": "Not found"})
+            self.send_response(404)
+            self.end_headers()
+            return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        payload = json.loads(body)
 
-        try:
-            payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+        data = load_data()
+        data.append(payload)
+        save_data(data)
 
-        text = (payload.get("text") or "").strip()
-        if not text:
-            return self._send_json(400, {"ok": False, "error": "Missing 'text'"})
-
-        level = (payload.get("level") or "good").strip()
-        source = (payload.get("source") or "manual").strip()
-
-        # حاليا: نعيد نجاح فقط (لاحقًا نضيف قاعدة البيانات)
-        return self._send_json(200, {"ok": True, "saved": True, "text": text, "level": level, "source": source})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "ok": True,
+            "saved": True
+        }).encode())
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
