@@ -2,94 +2,81 @@ import os
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# تخزين الجمل في الذاكرة (مؤقتًا)
+# تخزين مؤقت للجمل (في الذاكرة)
 SENTENCES = []
 
 class Handler(BaseHTTPRequestHandler):
 
-    def _set_headers(self, status=200):
+    def _send_json(self, status, data):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
+        self.wfile.write(json.dumps(data).encode("utf-8"))
 
     def do_GET(self):
-        if self.path == "/":
-            self._set_headers()
-            self.wfile.write(json.dumps({
+        if self.path == "/health":
+            self._send_json(200, {
                 "ok": True,
                 "service": "language-reminder-server"
-            }).encode())
-
-        elif self.path == "/health":
-            self._set_headers()
-            self.wfile.write(json.dumps({
-                "ok": True,
-                "service": "language-reminder-server"
-            }).encode())
+            })
 
         elif self.path == "/sentences":
-            self._set_headers()
-            self.wfile.write(json.dumps({
+            self._send_json(200, {
                 "ok": True,
                 "count": len(SENTENCES),
                 "sentences": SENTENCES
-            }).encode())
+            })
 
         else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({
+            self._send_json(404, {
                 "ok": False,
                 "error": "Not found"
-            }).encode())
+            })
 
     def do_POST(self):
-        if self.path != "/ingest":
-            self._set_headers(404)
-            self.wfile.write(json.dumps({
+        if self.path == "/ingest":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "Invalid JSON"
+                })
+                return
+
+            text = data.get("text")
+            level = data.get("level", "unknown")
+            source = data.get("source", "unknown")
+
+            if not text:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "Missing 'text'"
+                })
+                return
+
+            record = {
+                "text": text,
+                "level": level,
+                "source": source
+            }
+
+            SENTENCES.append(record)
+
+            self._send_json(200, {
+                "ok": True,
+                "saved": True,
+                "record": record
+            })
+
+        else:
+            self._send_json(404, {
                 "ok": False,
                 "error": "Not found"
-            }).encode())
-            return
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self._set_headers(400)
-            self.wfile.write(json.dumps({
-                "ok": False,
-                "error": "Invalid JSON"
-            }).encode())
-            return
-
-        text = data.get("text")
-        level = data.get("level", "unknown")
-        source = data.get("source", "unknown")
-
-        if not text:
-            self._set_headers(400)
-            self.wfile.write(json.dumps({
-                "ok": False,
-                "error": "Missing 'text'"
-            }).encode())
-            return
-
-        entry = {
-            "text": text,
-            "level": level,
-            "source": source
-        }
-
-        SENTENCES.append(entry)
-
-        self._set_headers()
-        self.wfile.write(json.dumps({
-            "ok": True,
-            "saved": True,
-            **entry
-        }).encode())
+            })
 
 
 if __name__ == "__main__":
