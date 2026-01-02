@@ -1,10 +1,10 @@
 import os
 import json
 import sqlite3
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-DB_FILE = "sentences.db"
-
+DB_FILE = "data.db"
 
 # ---------- Database ----------
 def init_db():
@@ -15,64 +15,71 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
             level TEXT,
-            source TEXT
+            source TEXT,
+            created_at TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-
 def insert_sentence(text, level, source):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO sentences (text, level, source) VALUES (?, ?, ?)",
-        (text, level, source)
+        "INSERT INTO sentences (text, level, source, created_at) VALUES (?, ?, ?, ?)",
+        (text, level, source, datetime.utcnow().isoformat())
     )
     conn.commit()
     conn.close()
 
-
-def get_all_sentences():
+def get_sentences():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT text, level, source FROM sentences ORDER BY id DESC")
+    cur.execute("SELECT text, level, source, created_at FROM sentences ORDER BY id DESC")
     rows = cur.fetchall()
     conn.close()
-    return [
-        {"text": r[0], "level": r[1], "source": r[2]}
-        for r in rows
-    ]
-
+    return rows
 
 # ---------- HTTP Handler ----------
 class Handler(BaseHTTPRequestHandler):
 
-    def _json(self, status, payload):
+    def _send_json(self, data, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.write(json.dumps(data).encode())
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"ok": True, "service": "language-reminder-server"})
+            self._send_json({
+                "ok": True,
+                "service": "language-reminder-server"
+            })
             return
 
         if self.path == "/sentences":
-            sentences = get_all_sentences()
-            self._json(200, {
+            rows = get_sentences()
+            sentences = [
+                {
+                    "text": r[0],
+                    "level": r[1],
+                    "source": r[2],
+                    "created_at": r[3]
+                }
+                for r in rows
+            ]
+            self._send_json({
                 "ok": True,
                 "count": len(sentences),
                 "sentences": sentences
             })
             return
 
-        self._json(404, {"ok": False, "error": "Not found"})
+        self._send_json({"ok": False, "error": "Not found"}, 404)
 
     def do_POST(self):
         if self.path != "/ingest":
-            self._json(404, {"ok": False, "error": "Not found"})
+            self._send_json({"ok": False, "error": "Not found"}, 404)
             return
 
         length = int(self.headers.get("Content-Length", 0))
@@ -81,20 +88,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body)
         except Exception:
-            self._json(400, {"ok": False, "error": "Invalid JSON"})
+            self._send_json({"ok": False, "error": "Invalid JSON"}, 400)
             return
 
         text = data.get("text")
         level = data.get("level", "unknown")
-        source = data.get("source", "manual")
+        source = data.get("source", "unknown")
 
         if not text:
-            self._json(400, {"ok": False, "error": "Missing 'text'"})
+            self._send_json({"ok": False, "error": "Missing 'text'"}, 400)
             return
 
         insert_sentence(text, level, source)
 
-        self._json(200, {
+        self._send_json({
             "ok": True,
             "saved": True,
             "record": {
@@ -103,7 +110,6 @@ class Handler(BaseHTTPRequestHandler):
                 "source": source
             }
         })
-
 
 # ---------- Main ----------
 if __name__ == "__main__":
