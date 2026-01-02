@@ -1,8 +1,9 @@
 import os
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
-# تخزين مؤقت في الذاكرة
+# تخزين الجمل في الذاكرة (مشترك بين كل الطلبات)
 SENTENCES = []
 
 class Handler(BaseHTTPRequestHandler):
@@ -14,13 +15,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urlparse(self.path).path
+
+        if path == "/health":
             self._send_json({
                 "ok": True,
                 "service": "language-reminder-server"
             })
 
-        elif self.path == "/sentences":
+        elif path == "/sentences":
             self._send_json({
                 "ok": True,
                 "count": len(SENTENCES),
@@ -31,14 +34,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "ok": False,
                 "error": "Not found"
-            }, status=404)
+            }, 404)
 
     def do_POST(self):
-        if self.path != "/ingest":
+        path = urlparse(self.path).path
+
+        if path != "/ingest":
             self._send_json({
                 "ok": False,
                 "error": "Not found"
-            }, status=404)
+            }, 404)
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -46,11 +51,11 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             data = json.loads(body)
-        except json.JSONDecodeError:
+        except Exception:
             self._send_json({
                 "ok": False,
                 "error": "Invalid JSON"
-            }, status=400)
+            }, 400)
             return
 
         text = data.get("text")
@@ -58,21 +63,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "ok": False,
                 "error": "Missing 'text'"
-            }, status=400)
+            }, 400)
             return
 
-        sentence = {
+        record = {
             "text": text,
-            "level": data.get("level", "unknown"),
-            "source": data.get("source", "unknown")
+            "level": data.get("level", "good"),
+            "source": data.get("source", "manual")
         }
 
-        SENTENCES.append(sentence)
+        SENTENCES.append(record)
 
         self._send_json({
             "ok": True,
             "saved": True,
-            **sentence
+            "record": record
         })
 
 
