@@ -1,87 +1,113 @@
 import os
 import json
+import sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
 
-# تخزين الجمل في الذاكرة (مشترك بين كل الطلبات)
-SENTENCES = []
+DB_FILE = "sentences.db"
 
+
+# ---------- Database ----------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sentences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            level TEXT,
+            source TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def insert_sentence(text, level, source):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sentences (text, level, source) VALUES (?, ?, ?)",
+        (text, level, source)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_sentences():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT text, level, source FROM sentences ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"text": r[0], "level": r[1], "source": r[2]}
+        for r in rows
+    ]
+
+
+# ---------- HTTP Handler ----------
 class Handler(BaseHTTPRequestHandler):
 
-    def _send_json(self, data, status=200):
+    def _json(self, status, payload):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(json.dumps(payload).encode())
 
     def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/health":
-            self._send_json({
-                "ok": True,
-                "service": "language-reminder-server"
-            })
-
-        elif path == "/sentences":
-            self._send_json({
-                "ok": True,
-                "count": len(SENTENCES),
-                "sentences": SENTENCES
-            })
-
-        else:
-            self._send_json({
-                "ok": False,
-                "error": "Not found"
-            }, 404)
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        if path != "/ingest":
-            self._send_json({
-                "ok": False,
-                "error": "Not found"
-            }, 404)
+        if self.path == "/health":
+            self._json(200, {"ok": True, "service": "language-reminder-server"})
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
+        if self.path == "/sentences":
+            sentences = get_all_sentences()
+            self._json(200, {
+                "ok": True,
+                "count": len(sentences),
+                "sentences": sentences
+            })
+            return
+
+        self._json(404, {"ok": False, "error": "Not found"})
+
+    def do_POST(self):
+        if self.path != "/ingest":
+            self._json(404, {"ok": False, "error": "Not found"})
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
 
         try:
             data = json.loads(body)
         except Exception:
-            self._send_json({
-                "ok": False,
-                "error": "Invalid JSON"
-            }, 400)
+            self._json(400, {"ok": False, "error": "Invalid JSON"})
             return
 
         text = data.get("text")
+        level = data.get("level", "unknown")
+        source = data.get("source", "manual")
+
         if not text:
-            self._send_json({
-                "ok": False,
-                "error": "Missing 'text'"
-            }, 400)
+            self._json(400, {"ok": False, "error": "Missing 'text'"})
             return
 
-        record = {
-            "text": text,
-            "level": data.get("level", "good"),
-            "source": data.get("source", "manual")
-        }
+        insert_sentence(text, level, source)
 
-        SENTENCES.append(record)
-
-        self._send_json({
+        self._json(200, {
             "ok": True,
             "saved": True,
-            "record": record
+            "record": {
+                "text": text,
+                "level": level,
+                "source": source
+            }
         })
 
 
+# ---------- Main ----------
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 8000))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"Server running on port {port}")
