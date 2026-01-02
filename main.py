@@ -4,9 +4,9 @@ import sqlite3
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-DB_FILE = "data.db"
+DB_FILE = "sentences.db"
 
-# ---------- Database ----------
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -22,25 +22,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def insert_sentence(text, level, source):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sentences (text, level, source, created_at) VALUES (?, ?, ?, ?)",
-        (text, level, source, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
 
-def get_sentences():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT text, level, source, created_at FROM sentences ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-# ---------- HTTP Handler ----------
 class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, data, status=200):
@@ -58,16 +40,25 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/sentences":
-            rows = get_sentences()
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT text, level, source, created_at
+                FROM sentences
+                ORDER BY id DESC
+            """)
+            rows = cur.fetchall()
+            conn.close()
+
             sentences = [
                 {
                     "text": r[0],
                     "level": r[1],
                     "source": r[2],
                     "created_at": r[3]
-                }
-                for r in rows
+                } for r in rows
             ]
+
             self._send_json({
                 "ok": True,
                 "count": len(sentences),
@@ -82,8 +73,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "Not found"}, 404)
             return
 
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
 
         try:
             data = json.loads(body)
@@ -96,10 +87,19 @@ class Handler(BaseHTTPRequestHandler):
         source = data.get("source", "unknown")
 
         if not text:
-            self._send_json({"ok": False, "error": "Missing 'text'"}, 400)
+            self._send_json({"ok": False, "error": "Missing text"}, 400)
             return
 
-        insert_sentence(text, level, source)
+        created_at = datetime.utcnow().isoformat()
+
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO sentences (text, level, source, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (text, level, source, created_at))
+        conn.commit()
+        conn.close()
 
         self._send_json({
             "ok": True,
@@ -107,11 +107,12 @@ class Handler(BaseHTTPRequestHandler):
             "record": {
                 "text": text,
                 "level": level,
-                "source": source
+                "source": source,
+                "created_at": created_at
             }
         })
 
-# ---------- Main ----------
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8000))
