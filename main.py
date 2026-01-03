@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 # ======================
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 # ======================
 DB_PATH = os.environ.get("DB_PATH", "sentences.db")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
 # ======================
@@ -26,17 +26,18 @@ def get_db():
 def ensure_column(conn: sqlite3.Connection, table: str, column_def: str):
     """
     Tries to add a column; ignores if it already exists.
-    column_def example: "telegram_chat_id INTEGER"
+    Example: column_def = "telegram_chat_id INTEGER"
     """
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
     except sqlite3.OperationalError:
-        # Most likely: duplicate column name
+        # likely "duplicate column name"
         pass
 
 def init_db():
     conn = get_db()
 
+    # Sentences table
     conn.execute("""
     CREATE TABLE IF NOT EXISTS sentences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,10 +50,10 @@ def init_db():
     )
     """)
 
-    # Add helpful columns if missing
+    # Useful extra column (optional)
     ensure_column(conn, "sentences", "telegram_chat_id INTEGER")
 
-    # Subscribers: store chat_ids that should receive reminders (for /ingest pushes)
+    # Subscribers table (Telegram chat_ids that receive pushes from /ingest)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS subscribers (
         telegram_chat_id INTEGER PRIMARY KEY,
@@ -84,6 +85,9 @@ class ReviewUpdate(BaseModel):
 # ======================
 # Helpers (SRS)
 # ======================
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
 def calc_next_review(state: str) -> str:
     now = datetime.utcnow()
     mapping = {
@@ -93,9 +97,6 @@ def calc_next_review(state: str) -> str:
         "easy":  now + timedelta(days=3),
     }
     return mapping.get(state, now + timedelta(days=1)).isoformat()
-
-def utc_now_iso() -> str:
-    return datetime.utcnow().isoformat()
 
 # ======================
 # Helpers (Telegram)
@@ -107,7 +108,7 @@ def tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not telegram_enabled():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set on the server.")
     url = f"{TELEGRAM_API_BASE}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=25)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
@@ -169,9 +170,9 @@ def save_sentence(text: str, level: str, source: str, telegram_chat_id: Optional
         VALUES (?, ?, ?, ?, ?)
     """, (text, level, source, now, telegram_chat_id))
     conn.commit()
-    sentence_id = int(cur.lastrowid)
+    sid = int(cur.lastrowid)
     conn.close()
-    return sentence_id
+    return sid
 
 def apply_review(sentence_id: int, review_state: str) -> Dict[str, Any]:
     next_time = calc_next_review(review_state)
@@ -200,12 +201,13 @@ def health():
 @app.post("/ingest")
 def ingest(sentence: SentenceIn):
     """
-    Used by Pipedream / Shortcut: saves the sentence
-    and also pushes it to all Telegram subscribers (if any).
+    Used by Pipedream / Shortcut:
+    - saves the sentence in SQLite
+    - pushes it to all Telegram subscribers with SRS buttons
     """
     sentence_id = save_sentence(sentence.text, sentence.level, sentence.source, telegram_chat_id=None)
 
-    # Push to Telegram (if bot configured and user already did /start)
+    # Push to Telegram subscribers (if any)
     if telegram_enabled():
         subs = list_subscribers()
         if subs:
@@ -215,7 +217,7 @@ def ingest(sentence: SentenceIn):
                 try:
                     tg_send_message(chat_id, msg, reply_markup=kb)
                 except Exception:
-                    # Do not fail ingestion if Telegram fails
+                    # Do not fail ingestion if Telegram fails for one user
                     pass
 
     return {"ok": True, "saved": True, "sentence_id": sentence_id}
@@ -258,14 +260,15 @@ def review(sentence_id: int, body: ReviewUpdate):
 # Telegram Webhook
 # ======================
 @app.post("/telegram/webhook")
-def telegram_webhook(update: Dict[str, Any]):
+async def telegram_webhook(request: Request):
     """
-    Telegram sends updates here.
     Handles:
-    - /start (register subscriber)
-    - normal messages (save and show SRS buttons)
-    - callback_query (user pressed Again/Hard/Good/Easy)
+    - /start  -> registers subscriber chat_id
+    - normal messages -> saves as sentence and returns SRS buttons
+    - button clicks (callback_query) -> updates review_state and next_review_at
     """
+    update: Dict[str, Any] = await request.json()
+
     # 1) Callback query (button press)
     if "callback_query" in update:
         cq = update["callback_query"]
@@ -284,14 +287,15 @@ def telegram_webhook(update: Dict[str, Any]):
                 sentence_id = int(sid_str)
                 result = apply_review(sentence_id, state)
 
-                # Acknowledge tap
+                # acknowledge the tap
                 try:
-                    tg_answer_callback(cq_id, text="تم تسجيل اختيارك")
+                    if cq_id:
+                        tg_answer_callback(cq_id, text="تم تسجيل اختيارك")
                 except Exception:
                     pass
 
-                # Edit original message to confirm and remove keyboard
-                if isinstance(chat_id, int) and isinstance(message_id, int):
+                # edit original message to confirm and remove buttons
+                if isinstance(chat_id, int) and isinstance(message_id, int) and telegram_enabled():
                     confirm_text = (
                         "تم تحديث المراجعة.\n\n"
                         f"الحالة: {result['review_state']}\n"
@@ -303,9 +307,8 @@ def telegram_webhook(update: Dict[str, Any]):
                         pass
 
         except Exception:
-            # Do not crash webhook
             try:
-                if cq_id:
+                if cq_id and telegram_enabled():
                     tg_answer_callback(cq_id, text="حدث خطأ")
             except Exception:
                 pass
@@ -329,15 +332,17 @@ def telegram_webhook(update: Dict[str, Any]):
                 tg_send_message(
                     chat_id,
                     "تم تفعيل البوت.\n"
-                    "أرسل أي جملة الآن، وسأعرض لك أزرار التقييم (Again/Hard/Good/Easy)."
+                    "الآن يمكنك:\n"
+                    "1) إرسال جملة مباشرة هنا، وسأعرض أزرار التقييم.\n"
+                    "2) أو إرسال جملة من الآيفون عبر Pipedream، وستصل هنا أيضًا مع الأزرار."
                 )
             return {"ok": True}
 
-        # Ignore empty messages
+        # ignore empty texts
         if not text:
             return {"ok": True}
 
-        # Save sentence and ask for rating
+        # Save sentence and show rating buttons
         try:
             sentence_id = save_sentence(text=text, level="good", source="telegram", telegram_chat_id=chat_id)
             if telegram_enabled():
@@ -345,7 +350,6 @@ def telegram_webhook(update: Dict[str, Any]):
                 kb = srs_keyboard(sentence_id)
                 tg_send_message(chat_id, msg_text, reply_markup=kb)
         except Exception:
-            # If something fails, try to notify user
             try:
                 if telegram_enabled():
                     tg_send_message(chat_id, "حدث خطأ أثناء حفظ الجملة.")
