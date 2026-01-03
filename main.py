@@ -3,55 +3,68 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import Application
 
 
 # ======================
 # ENV
 # ======================
 DB_PATH = os.environ.get("DB_PATH", "sentences.db")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
-if not TELEGRAM_BOT_TOKEN:
-    # سيعمل السيرفر، لكن تيليغرام لن يعمل بدون التوكن
-    print("WARNING: TELEGRAM_BOT_TOKEN is missing. Telegram webhook will fail.")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+# ضع CHAT_ID كمتغير بيئة في Railway (مهم جدًا لإرسال الرسائل)
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+# (اختياري) سرّ بسيط لحماية ingest من أي طلبات عشوائية:
+INGEST_SECRET = os.environ.get("INGEST_SECRET", "").strip()
 
 
 # ======================
 # Database (SQLite)
 # ======================
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
     conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sentences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            level TEXT NOT NULL,
-            source TEXT NOT NULL,
-            review_state TEXT DEFAULT 'new',
-            next_review_at TEXT,
-            created_at TEXT NOT NULL
-        )
-        """
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS sentences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        level TEXT NOT NULL,
+        source TEXT NOT NULL,
+        review_state TEXT DEFAULT 'new',
+        next_review_at TEXT,
+        created_at TEXT NOT NULL
     )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """)
     conn.commit()
     conn.close()
 
+def set_setting(key: str, value: str):
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO settings(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, value))
+    conn.commit()
+    conn.close()
+
+def get_setting(key: str) -> Optional[str]:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
 
 init_db()
 
@@ -63,21 +76,13 @@ app = FastAPI(title="Language Reminder Server")
 
 
 # ======================
-# Telegram (python-telegram-bot)
-# ======================
-telegram_app: Optional[Application] = None
-
-if TELEGRAM_BOT_TOKEN:
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-
-# ======================
 # Models
 # ======================
 class SentenceIn(BaseModel):
     text: str
-    level: str
-    source: str
+    level: str = "good"
+    source: str = "pipedream"
+    secret: Optional[str] = None  # اختياري
 
 
 class ReviewUpdate(BaseModel):
@@ -85,7 +90,7 @@ class ReviewUpdate(BaseModel):
 
 
 # ======================
-# SRS Helpers
+# Helpers
 # ======================
 def calc_next_review(state: str) -> str:
     now = datetime.utcnow()
@@ -97,224 +102,234 @@ def calc_next_review(state: str) -> str:
     }
     return mapping.get(state, now + timedelta(days=1)).isoformat()
 
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def effective_chat_id() -> str:
+    # أولوية: متغير بيئة -> آخر chat_id وصلنا من /start
+    if TELEGRAM_CHAT_ID:
+        return TELEGRAM_CHAT_ID
+    saved = get_setting("telegram_chat_id")
+    return saved or ""
+
+async def tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+async def send_sentence_to_telegram(sentence_row: Dict[str, Any]) -> None:
+    chat_id = effective_chat_id()
+    if not chat_id:
+        # لا يمكن الإرسال بدون chat_id
+        return
+
+    sid = sentence_row["id"]
+    text = sentence_row["text"]
+    level = sentence_row["level"]
+    source = sentence_row["source"]
+
+    msg = (
+        f"🧠 *New sentence*\n\n"
+        f"*ID:* `{sid}`\n"
+        f"*Level:* `{level}`\n"
+        f"*Source:* `{source}`\n\n"
+        f"✍️ {text}\n\n"
+        f"اختر مستوى التذكر لتحديث الجدولة:"
+    )
+
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "again", "callback_data": f"review:{sid}:again"},
+            {"text": "hard",  "callback_data": f"review:{sid}:hard"},
+            {"text": "good",  "callback_data": f"review:{sid}:good"},
+            {"text": "easy",  "callback_data": f"review:{sid}:easy"},
+        ]]
+    }
+
+    await tg_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "Markdown",
+        "reply_markup": keyboard
+    })
+
 
 # ======================
-# DB Helpers
+# Routes (Basic)
 # ======================
-def db_insert_sentence(text: str, level: str, source: str) -> int:
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "language-reminder-server"}
+
+@app.post("/ingest")
+async def ingest(sentence: SentenceIn):
+    # حماية اختيارية
+    if INGEST_SECRET:
+        if not sentence.secret or sentence.secret != INGEST_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid secret")
+
+    text = (sentence.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
     conn = get_db()
-    now = datetime.utcnow().isoformat()
-    cur = conn.execute(
-        """
+    now = utc_now_iso()
+    cur = conn.execute("""
         INSERT INTO sentences (text, level, source, created_at)
         VALUES (?, ?, ?, ?)
-        """,
-        (text, level, source, now),
-    )
+    """, (text, sentence.level, sentence.source, now))
     conn.commit()
-    new_id = cur.lastrowid
+
+    sid = cur.lastrowid
+    row = conn.execute("SELECT * FROM sentences WHERE id = ?", (sid,)).fetchone()
     conn.close()
-    return int(new_id)
 
+    # إرسال فوري إلى تيليغرام
+    try:
+        await send_sentence_to_telegram(dict(row))
+    except Exception:
+        # لا نُفشل ingest بسبب خطأ تيليغرام
+        pass
 
-def db_get_sentences(limit: int = 50):
+    return {"ok": True, "saved": True, "id": sid}
+
+@app.get("/sentences")
+def get_sentences(limit: int = 50):
     conn = get_db()
-    rows = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT * FROM sentences
         ORDER BY created_at DESC
         LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    """, (limit,)).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return {"ok": True, "count": len(rows), "sentences": [dict(r) for r in rows]}
 
-
-def db_get_next_sentence() -> Optional[Dict[str, Any]]:
+@app.get("/next")
+def next_sentence():
     conn = get_db()
-    now = datetime.utcnow().isoformat()
-    row = conn.execute(
-        """
+    now = utc_now_iso()
+    row = conn.execute("""
         SELECT * FROM sentences
         WHERE next_review_at IS NULL
            OR next_review_at <= ?
         ORDER BY COALESCE(next_review_at, created_at) ASC
         LIMIT 1
-        """,
-        (now,),
-    ).fetchone()
+    """, (now,)).fetchone()
     conn.close()
-    return dict(row) if row else None
 
+    if not row:
+        return {"ok": True, "sentence": None}
+    return {"ok": True, "sentence": dict(row)}
 
-def db_review(sentence_id: int, state: str) -> Dict[str, Any]:
+@app.post("/review/{sentence_id}")
+def review(sentence_id: int, body: ReviewUpdate):
+    state = (body.review_state or "").strip().lower()
+    if state not in {"again", "hard", "good", "easy"}:
+        raise HTTPException(status_code=400, detail="Invalid review_state")
+
     next_time = calc_next_review(state)
 
     conn = get_db()
-    cur = conn.execute(
-        """
+    cur = conn.execute("""
         UPDATE sentences
         SET review_state = ?, next_review_at = ?
         WHERE id = ?
-        """,
-        (state, next_time, sentence_id),
-    )
+    """, (state, next_time, sentence_id))
     conn.commit()
     conn.close()
 
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Sentence not found")
 
-    return {"sentence_id": sentence_id, "review_state": state, "next_review_at": next_time}
+    return {"ok": True, "sentence_id": sentence_id, "review_state": state, "next_review_at": next_time}
 
 
 # ======================
-# Telegram Message Helpers
-# ======================
-def build_review_keyboard(sentence_id: int) -> InlineKeyboardMarkup:
-    # callback_data قصيرة وواضحة
-    # review:<id>:<state>
-    keyboard = [
-        [
-            InlineKeyboardButton("Again", callback_data=f"review:{sentence_id}:again"),
-            InlineKeyboardButton("Hard",  callback_data=f"review:{sentence_id}:hard"),
-        ],
-        [
-            InlineKeyboardButton("Good",  callback_data=f"review:{sentence_id}:good"),
-            InlineKeyboardButton("Easy",  callback_data=f"review:{sentence_id}:easy"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def format_sentence_msg(s: Dict[str, Any]) -> str:
-    # نص بسيط وواضح
-    text = (s.get("text") or "").strip()
-    level = (s.get("level") or "").strip()
-    source = (s.get("source") or "").strip()
-    sid = s.get("id")
-    return f"Sentence #{sid}\nLevel: {level}\nSource: {source}\n\n{text}"
-
-
-async def tg_send_next(chat_id: int):
-    if not telegram_app:
-        raise HTTPException(status_code=500, detail="Telegram app not configured")
-
-    s = db_get_next_sentence()
-    if not s:
-        await telegram_app.bot.send_message(chat_id=chat_id, text="لا توجد جمل مستحقة للمراجعة الآن.")
-        return
-
-    await telegram_app.bot.send_message(
-        chat_id=chat_id,
-        text=format_sentence_msg(s),
-        reply_markup=build_review_keyboard(int(s["id"])),
-    )
-
-
-# ======================
-# REST Routes (Existing)
-# ======================
-@app.get("/health")
-def health():
-    return {"ok": True, "service": "language-reminder-server"}
-
-
-@app.post("/ingest")
-def ingest(sentence: SentenceIn):
-    new_id = db_insert_sentence(sentence.text, sentence.level, sentence.source)
-    return {"ok": True, "saved": True, "id": new_id}
-
-
-@app.get("/sentences")
-def get_sentences(limit: int = 50):
-    rows = db_get_sentences(limit=limit)
-    return {"ok": True, "count": len(rows), "sentences": rows}
-
-
-@app.get("/next")
-def next_sentence():
-    row = db_get_next_sentence()
-    return {"ok": True, "sentence": row}
-
-
-@app.post("/review/{sentence_id}")
-def review(sentence_id: int, body: ReviewUpdate):
-    result = db_review(sentence_id, body.review_state)
-    return {"ok": True, **result}
-
-
-# ======================
-# Telegram Webhook Route
+# Telegram Webhook
 # ======================
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    if not telegram_app:
-        raise HTTPException(status_code=500, detail="Telegram is not configured. Set TELEGRAM_BOT_TOKEN.")
+    update = await req.json()
 
-    data = await req.json()
+    # 1) إذا جاءت رسالة /start: احفظ chat_id كي نرسل له لاحقًا
+    message = update.get("message") or update.get("edited_message")
+    if message:
+        chat = message.get("chat", {})
+        chat_id = chat.get("id")
+        text = (message.get("text") or "").strip()
 
-    # تحويل JSON إلى Update
-    update = Update.de_json(data, telegram_app.bot)
+        if chat_id:
+            set_setting("telegram_chat_id", str(chat_id))
 
-    # 1) /start أو أي رسالة
-    if update.message and update.message.text:
-        txt = update.message.text.strip()
-        chat_id = update.message.chat_id
+        # رد بسيط عند /start فقط
+        if text == "/start":
+            try:
+                await tg_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "✅ Bot is connected. Now send sentences from iPhone → Pipedream → /ingest, and I will notify you here."
+                })
+            except Exception:
+                pass
 
-        if txt.startswith("/start"):
-            await telegram_app.bot.send_message(
-                chat_id=chat_id,
-                text="تم التشغيل. سأرسل لك الآن الجملة القادمة للمراجعة.",
-            )
-            await tg_send_next(chat_id)
-            return {"ok": True}
+    # 2) إذا جاء callback من الأزرار: حدث الجدولة
+    cb = update.get("callback_query")
+    if cb:
+        data = (cb.get("data") or "").strip()
+        cb_id = cb.get("id")
+        from_msg = cb.get("message") or {}
+        chat_id = (from_msg.get("chat") or {}).get("id")
 
-        # أي رسالة أخرى: نرسل الجملة القادمة أيضًا (اختياري)
-        await telegram_app.bot.send_message(
-            chat_id=chat_id,
-            text="استلمت رسالتك. هذه هي الجملة القادمة للمراجعة:",
-        )
-        await tg_send_next(chat_id)
-        return {"ok": True}
+        if data.startswith("review:"):
+            # review:{sid}:{state}
+            parts = data.split(":")
+            if len(parts) == 3:
+                sid = int(parts[1])
+                state = parts[2].lower().strip()
 
-    # 2) ضغط أزرار التقييم
-    if update.callback_query and update.callback_query.data:
-        cq = update.callback_query
-        chat_id = cq.message.chat_id if cq.message else None
+                try:
+                    # تحديث DB
+                    next_time = calc_next_review(state)
+                    conn = get_db()
+                    cur = conn.execute("""
+                        UPDATE sentences
+                        SET review_state = ?, next_review_at = ?
+                        WHERE id = ?
+                    """, (state, next_time, sid))
+                    conn.commit()
+                    conn.close()
 
-        # مهم: تأكيد الاستلام حتى لا يبقى زر التحميل في تيليغرام
-        await telegram_app.bot.answer_callback_query(callback_query_id=cq.id)
+                    if cur.rowcount == 0:
+                        raise ValueError("Sentence not found")
 
-        try:
-            parts = cq.data.split(":")
-            # review:<id>:<state>
-            if len(parts) != 3 or parts[0] != "review":
-                raise ValueError("Bad callback_data")
+                    # إشعار صغير
+                    try:
+                        await tg_api("answerCallbackQuery", {
+                            "callback_query_id": cb_id,
+                            "text": f"Saved: {state} ✅"
+                        })
+                    except Exception:
+                        pass
 
-            sentence_id = int(parts[1])
-            state = parts[2].strip().lower()
+                    # رسالة تأكيد
+                    try:
+                        await tg_api("sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"✅ Updated sentence #{sid}\nState: {state}\nNext: {next_time}"
+                        })
+                    except Exception:
+                        pass
 
-            if state not in {"again", "hard", "good", "easy"}:
-                raise ValueError("Bad state")
+                except Exception:
+                    try:
+                        await tg_api("answerCallbackQuery", {
+                            "callback_query_id": cb_id,
+                            "text": "Error updating review"
+                        })
+                    except Exception:
+                        pass
 
-            r = db_review(sentence_id, state)
-
-            if chat_id is not None:
-                await telegram_app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"تم حفظ التقييم: {state}\nالمراجعة القادمة: {r['next_review_at']}",
-                )
-                # إرسال الجملة التالية مباشرة
-                await tg_send_next(chat_id)
-
-            return {"ok": True}
-
-        except Exception:
-            if chat_id is not None:
-                await telegram_app.bot.send_message(chat_id=chat_id, text="حدث خطأ في معالجة التقييم.")
-            return {"ok": False}
-
-    # أي تحديث آخر نتجاهله بأمان
     return {"ok": True}
