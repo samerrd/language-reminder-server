@@ -1,2 +1,6 @@
-flask
-psycopg2-binary
+fastapi==0.115.6
+uvicorn==0.32.1
+pydantic==2.10.3
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+anyio==4.7.0
