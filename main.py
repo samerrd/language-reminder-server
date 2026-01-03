@@ -2,14 +2,24 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+
+# ======================
+# Environment
+# ======================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+DB_PATH = os.environ.get("DB_PATH", "sentences.db")
 
 # ======================
 # Database (SQLite)
 # ======================
-DB_PATH = os.environ.get("DB_PATH", "sentences.db")
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -20,6 +30,7 @@ def init_db():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS sentences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
         text TEXT NOT NULL,
         level TEXT NOT NULL,
         source TEXT NOT NULL,
@@ -62,54 +73,76 @@ def calc_next_review(state: str) -> str:
     }
     return mapping.get(state, now + timedelta(days=1)).isoformat()
 
+def send_message(chat_id: int, text: str):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text
+    }
+    requests.post(url, json=payload)
+
 # ======================
-# Routes
+# Routes - Health
 # ======================
 @app.get("/health")
 def health():
     return {"ok": True, "service": "language-reminder-server"}
 
+# ======================
+# Routes - iPhone / Pipedream
+# ======================
 @app.post("/ingest")
 def ingest(sentence: SentenceIn):
     conn = get_db()
     now = datetime.utcnow().isoformat()
     conn.execute("""
-        INSERT INTO sentences (text, level, source, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (sentence.text, sentence.level, sentence.source, now))
+        INSERT INTO sentences (chat_id, text, level, source, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (0, sentence.text, sentence.level, sentence.source, now))
     conn.commit()
     conn.close()
     return {"ok": True, "saved": True}
 
-@app.get("/sentences")
-def get_sentences(limit: int = 50):
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT * FROM sentences
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    return {"ok": True, "count": len(rows), "sentences": [dict(r) for r in rows]}
+# ======================
+# Routes - Telegram Webhook
+# ======================
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+    print("TELEGRAM UPDATE:", update)
 
-@app.get("/next")
-def next_sentence():
+    message = update.get("message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "").strip()
+
+    if text == "/start":
+        send_message(
+            chat_id,
+            "👋 مرحبًا بك في Language Reminder\n\n"
+            "أرسل لي أي جملة الآن، وسأبدأ تذكيرك بها تلقائيًا."
+        )
+        return {"ok": True}
+
+    # Save sentence from Telegram
     conn = get_db()
     now = datetime.utcnow().isoformat()
-    row = conn.execute("""
-        SELECT * FROM sentences
-        WHERE next_review_at IS NULL
-           OR next_review_at <= ?
-        ORDER BY COALESCE(next_review_at, created_at) ASC
-        LIMIT 1
-    """, (now,)).fetchone()
+    conn.execute("""
+        INSERT INTO sentences (chat_id, text, level, source, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (chat_id, text, "telegram", "telegram", now))
+    conn.commit()
     conn.close()
 
-    if not row:
-        return {"ok": True, "sentence": None}
+    send_message(chat_id, "✅ تم حفظ الجملة. سأذكّرك بها لاحقًا.")
 
-    return {"ok": True, "sentence": dict(row)}
+    return {"ok": True}
 
+# ======================
+# Review Logic
+# ======================
 @app.post("/review/{sentence_id}")
 def review(sentence_id: int, body: ReviewUpdate):
     next_time = calc_next_review(body.review_state)
